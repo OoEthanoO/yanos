@@ -1,3 +1,5 @@
+#define NULL ((void*)0)
+
 static inline unsigned char inportb(unsigned short port) {
     unsigned char ret;
     asm volatile ( "inb %1, %0"
@@ -73,6 +75,7 @@ static int strncmp_simple(const char* s1, const char* s2, unsigned int n) {
 
 #define MAX_COMMAND_LENGTH 80
 #define OS_VERSION "YanOS v0.1"
+#define OS_AUTHOR_INFO "Author: Ethan Yan Xu. A simple hobby OS."
 
 struct File {
     char name[16];
@@ -125,6 +128,40 @@ static int fs_write_file(const char* filename, const char* data) {
         }
     }
     return 1;
+}
+
+static int fs_read_file(
+    const char* filename,
+    char* vidptr,
+    unsigned int* cursor_pos_ptr,
+    unsigned int screen_width_chars,
+    unsigned int screen_total_bytes
+) {
+    for (int i = 0; i < MAX_FILES; i++) {
+        if (file_table[i].in_use == 1 && strcmp_simple(file_table[i].name, filename) == 0) {
+            unsigned int content_idx = 0;
+            while (file_table[i].content[content_idx] != '\0') {
+                if (*cursor_pos_ptr >= screen_total_bytes - 2 && file_table[i].content[content_idx] != '\n') {
+                    break;
+                }
+
+                if (file_table[i].content[content_idx] == '\n') {
+                    unsigned int current_row_for_newline = (*cursor_pos_ptr / 2) / screen_width_chars;
+                    *cursor_pos_ptr = (current_row_for_newline + 1) * screen_width_chars * 2;
+                    if (*cursor_pos_ptr >= screen_total_bytes) {
+                        break;
+                    }
+                } else {
+                    vidptr[*cursor_pos_ptr] = file_table[i].content[content_idx];
+                    vidptr[*cursor_pos_ptr + 1] = 0x07;
+                    *cursor_pos_ptr += 2;
+                }
+                content_idx++;
+            }
+            return 0; // Success
+        }
+    }
+    return 1; // File not found
 }
 
 static void fs_list_files(
@@ -183,12 +220,13 @@ void kmain(void) {
         vidptr[loop_idx+1] = 0x07;
     }
 
-    unsigned int version_char_idx = 0;
-    while(OS_VERSION[version_char_idx] != '\0' && cursor_pos < screen_total_bytes) {
-        vidptr[cursor_pos] = OS_VERSION[version_char_idx];
+    const char *os_display_name = "YanOS";
+    unsigned int display_name_char_idx = 0;
+    while(os_display_name[display_name_char_idx] != '\0' && cursor_pos < screen_total_bytes) {
+        vidptr[cursor_pos] = os_display_name[display_name_char_idx];
         vidptr[cursor_pos+1] = 0x07;
         cursor_pos += 2;
-        version_char_idx++;
+        display_name_char_idx++;
     }
 
     if (cursor_pos < screen_total_bytes) {
@@ -266,12 +304,13 @@ void kmain(void) {
                         }
                         cursor_pos = 0;
                         
-                        unsigned int version_char_idx_cls = 0;
-                        while(OS_VERSION[version_char_idx_cls] != '\0' && cursor_pos < screen_total_bytes) {
-                            vidptr[cursor_pos] = OS_VERSION[version_char_idx_cls];
+                        const char *os_display_name = "YanOS";
+                        unsigned int display_name_char_idx = 0;
+                        while(os_display_name[display_name_char_idx] != '\0' && cursor_pos < screen_total_bytes) {
+                            vidptr[cursor_pos] = os_display_name[display_name_char_idx];
                             vidptr[cursor_pos+1] = 0x07;
                             cursor_pos += 2;
-                            version_char_idx_cls++;
+                            display_name_char_idx++;
                         }
 
                         update_cursor(cursor_pos);
@@ -338,6 +377,53 @@ void kmain(void) {
                                 vidptr[cursor_pos+1] = 0x07;
                                 cursor_pos += 2;
                                 k++;
+                            }
+                        }
+                    } else if (strncmp_simple(command_buffer, "read ", 5) == 0) {
+                        command_found = 1;
+                        const char* filename_to_read = command_buffer + 5;
+                        const char* msg = NULL;
+
+                        if (strlen_simple(filename_to_read) > 0) {
+                            if (fs_read_file(filename_to_read, vidptr, &cursor_pos, screen_width_chars, screen_total_bytes) != 0) {
+                                msg = "Error: File not found.";
+                            }
+                        } else {
+                            msg = "Usage: read <filename>";
+                        }
+
+                        if (msg) {
+                            unsigned int k = 0;
+                            if (cursor_pos < screen_total_bytes) {
+                                while(msg[k] != '\0' && cursor_pos < screen_total_bytes - 2) {
+                                    vidptr[cursor_pos] = msg[k];
+                                    vidptr[cursor_pos+1] = 0x07;
+                                    cursor_pos += 2;
+                                    k++;
+                                }
+                            }
+                        }
+                    } else if (strcmp_simple(command_buffer, "version") == 0) {
+                        command_found = 1;
+                        unsigned int k = 0;
+                        if (cursor_pos < screen_total_bytes) {
+                            while(OS_VERSION[k] != '\0' && cursor_pos < screen_total_bytes - 2) {
+                                vidptr[cursor_pos] = OS_VERSION[k];
+                                vidptr[cursor_pos+1] = 0x07;
+                                cursor_pos += 2;
+                                k++;
+                            }
+                            unsigned int current_row = (cursor_pos / 2) / screen_width_chars;
+                            cursor_pos = (current_row + 1) * screen_width_chars * 2;
+                            if (cursor_pos >= screen_total_bytes) {
+                            } else {
+                                k = 0;
+                                while(OS_AUTHOR_INFO[k] != '\0' && cursor_pos < screen_total_bytes - 2) {
+                                    vidptr[cursor_pos] = OS_AUTHOR_INFO[k];
+                                    vidptr[cursor_pos+1] = 0x07;
+                                    cursor_pos += 2;
+                                    k++;
+                                }
                             }
                         }
                     }
