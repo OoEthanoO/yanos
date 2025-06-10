@@ -12,6 +12,82 @@ static inline void outportb(unsigned short port, unsigned char data) {
     asm volatile ( "outb %0, %1" : : "a"(data), "Nd"(port) );
 }
 
+static inline unsigned short inportw(unsigned short port) {
+    unsigned short ret;
+    asm volatile ( "inw %1, %0"
+                   : "=a"(ret)
+                   : "Nd"(port) );
+    return ret;
+}
+
+#define ATA_PRIMARY_DATA         0x1F0
+#define ATA_PRIMARY_ERROR        0x1F1
+#define ATA_PRIMARY_SECTOR_COUNT 0x1F2
+#define ATA_PRIMARY_LBA_LOW      0x1F3
+#define ATA_PRIMARY_LBA_MID      0x1F4
+#define ATA_PRIMARY_LBA_HIGH     0x1F5
+#define ATA_PRIMARY_DRIVE_HEAD   0x1F6
+#define ATA_PRIMARY_COMMAND      0x1F7
+#define ATA_PRIMARY_STATUS       0x1F7
+
+#define ATA_CMD_READ_SECTORS  0x20
+#define ATA_CMD_WRITE_SECTORS 0x30
+#define ATA_CMD_CACHE_FLUSH   0xE7
+#define ATA_CMD_IDENTIFY      0xEC
+
+#define ATA_SR_BSY  0x80
+#define ATA_SR_DRDY 0x40
+#define ATA_SR_DF   0x20
+#define ATA_SR_DSC  0x10
+#define ATA_SR_DRQ  0x08
+#define ATA_SR_CORR 0x04
+#define ATA_SR_IDX  0x02
+#define ATA_SR_ERR  0x01
+
+static void ata_wait_bsy_clear(void) {
+    while (inportb(ATA_PRIMARY_STATUS) & ATA_SR_BSY) {
+    }
+}
+
+static void ata_wait_drq_set(void) {
+    while (!(inportb(ATA_PRIMARY_STATUS) & ATA_SR_DRQ)) {
+        if (inportb(ATA_PRIMARY_STATUS) & ATA_SR_ERR) {
+            return;
+        }
+    }
+}
+
+static int read_disk_sector(unsigned int lba, unsigned char* buffer) {
+    ata_wait_bsy_clear();
+    while (!(inportb(ATA_PRIMARY_STATUS) & ATA_SR_DRDY)) {
+        if (inportb(ATA_PRIMARY_STATUS) & ATA_SR_ERR) return 1;
+    }
+
+    outportb(ATA_PRIMARY_DRIVE_HEAD, 0xE0 | ((lba >> 24) & 0x0F));
+
+    outportb(ATA_PRIMARY_SECTOR_COUNT, 1);
+
+    outportb(ATA_PRIMARY_LBA_LOW, (unsigned char)(lba & 0xFF));
+
+    outportb(ATA_PRIMARY_LBA_MID, (unsigned char)((lba >> 8) & 0xFF));
+
+    outportb(ATA_PRIMARY_LBA_HIGH, (unsigned char)((lba >> 16) & 0xFF));
+
+    outportb(ATA_PRIMARY_COMMAND, ATA_CMD_READ_SECTORS);
+
+    ata_wait_drq_set();
+    if (inportb(ATA_PRIMARY_STATUS) & ATA_SR_ERR) {
+        return 1;
+    }
+
+    for (int i = 0; i < 256; i++) {
+        unsigned short data_word = inportw(ATA_PRIMARY_DATA);
+        buffer[i * 2] = (unsigned char)(data_word & 0xFF);
+        buffer[i * 2 + 1] = (unsigned char)((data_word >> 8) & 0xFF);
+    }
+    return 0;
+}
+
 static void update_cursor(unsigned int screen_offset) {
     unsigned short position = screen_offset / 2;
 
@@ -38,7 +114,13 @@ static const char scancode_map[] = {
     0, ' '
 };
 
+#define KEY_LEFT_ARROW 0x01
+#define KEY_RIGHT_ARROW 0x02
+
 static char scancode_to_ascii(unsigned char scancode) {
+    if (scancode == 0x4B) return KEY_LEFT_ARROW;
+    if (scancode == 0x4D) return KEY_RIGHT_ARROW;
+
     if (scancode < sizeof(scancode_map)) {
         return scancode_map[scancode];
     }
@@ -74,7 +156,7 @@ static int strncmp_simple(const char* s1, const char* s2, unsigned int n) {
 }
 
 #define MAX_COMMAND_LENGTH 80
-#define OS_VERSION "YanOS v0.1"
+#define OS_VERSION "YanOS v0.1.0"
 #define OS_AUTHOR_INFO "Author: Ethan Yan Xu. A simple hobby OS."
 
 struct File {
@@ -130,6 +212,16 @@ static int fs_write_file(const char* filename, const char* data) {
     return 1;
 }
 
+static int fs_delete_file(const char* filename) {
+    for (int i = 0; i < MAX_FILES; i++) {
+        if (file_table[i].in_use == 1 && strcmp_simple(file_table[i].name, filename) == 0) {
+            file_table[i].in_use = 0;
+            return 0;
+        }
+    }
+    return 1;
+}
+
 static int fs_read_file(
     const char* filename,
     char* vidptr,
@@ -158,10 +250,10 @@ static int fs_read_file(
                 }
                 content_idx++;
             }
-            return 0; // Success
+            return 0;
         }
     }
-    return 1; // File not found
+    return 1;
 }
 
 static void fs_list_files(
@@ -213,7 +305,8 @@ void kmain(void) {
     const unsigned int prompt_len_bytes = prompt_len_chars * 2;
 
     char command_buffer[MAX_COMMAND_LENGTH];
-    unsigned int command_buffer_idx = 0;
+    unsigned int command_length = 0;
+    unsigned int command_cursor_logical_idx = 0;
 
     for (loop_idx = 0; loop_idx < screen_total_bytes; loop_idx += 2) {
         vidptr[loop_idx] = ' ';
@@ -266,7 +359,8 @@ void kmain(void) {
         cursor_pos = current_line_input_start_offset;
         update_cursor(cursor_pos);
 
-        command_buffer_idx = 0;
+        command_length = 0;
+        command_cursor_logical_idx = 0;
 
         while(1) {
             unsigned char scancode = read_scancode();
@@ -274,19 +368,18 @@ void kmain(void) {
 
             if (pressed_char != 0) {
                 if (pressed_char == '\n') {
-                    command_buffer[command_buffer_idx] = '\0';
+                    command_buffer[command_length] = '\0';
 
                     unsigned int current_row = (cursor_pos / 2) / screen_width_chars;
                     cursor_pos = (current_row + 1) * screen_width_chars * 2;
                     
                     if (cursor_pos >= screen_total_bytes) {
                     }
-                    update_cursor(cursor_pos);
 
                     int command_found = 0;
                     if (strcmp_simple(command_buffer, "help") == 0) {
                         command_found = 1;
-                        const char* help_msg = "Available commands: help, cls, mkfile <filename>, ls, write <filename> <content>";
+                        const char* help_msg = "Available commands: help, cls, mkfile <filename>, ls, write <filename> <content>, read <filename>, rm <filename>, version";
                         unsigned int k = 0;
                         if (cursor_pos < screen_total_bytes) { 
                             while(help_msg[k] != '\0' && cursor_pos < screen_total_bytes) {
@@ -403,6 +496,52 @@ void kmain(void) {
                                 }
                             }
                         }
+                    } else if (strncmp_simple(command_buffer, "rm ", 3) == 0) {
+                        command_found = 1;
+                        const char* filename_to_delete = command_buffer + 3;
+                        const char* msg;
+                        if (strlen_simple(filename_to_delete) > 0) {
+                            if (fs_delete_file(filename_to_delete) == 0) {
+                                msg = "File deleted.";
+                            } else {
+                                msg = "Error deleting file (not found).";
+                            }
+                        } else {
+                            msg = "Usage: rm <filename>";
+                        }
+                        unsigned int k = 0;
+                        if (cursor_pos < screen_total_bytes) {
+                            while(msg[k] != '\0' && cursor_pos < screen_total_bytes - 2) {
+                                vidptr[cursor_pos] = msg[k];
+                                vidptr[cursor_pos+1] = 0x07;
+                                cursor_pos += 2;
+                                k++;
+                            }
+                        }
+                    } else if (strncmp_simple(command_buffer, "read ", 5) == 0) {
+                        command_found = 1;
+                        const char* filename_to_read = command_buffer + 5;
+                        const char* msg = NULL;
+
+                        if (strlen_simple(filename_to_read) > 0) {
+                            if (fs_read_file(filename_to_read, vidptr, &cursor_pos, screen_width_chars, screen_total_bytes) != 0) {
+                                msg = "Error: File not found.";
+                            }
+                        } else {
+                            msg = "Usage: read <filename>";
+                        }
+
+                        if (msg) {
+                            unsigned int k = 0;
+                            if (cursor_pos < screen_total_bytes) {
+                                while(msg[k] != '\0' && cursor_pos < screen_total_bytes - 2) {
+                                    vidptr[cursor_pos] = msg[k];
+                                    vidptr[cursor_pos+1] = 0x07;
+                                    cursor_pos += 2;
+                                    k++;
+                                }
+                            }
+                        }
                     } else if (strcmp_simple(command_buffer, "version") == 0) {
                         command_found = 1;
                         unsigned int k = 0;
@@ -428,7 +567,7 @@ void kmain(void) {
                         }
                     }
                     
-                    if (!command_found && command_buffer_idx > 0) {
+                    if (!command_found && command_length > 0) {
                         const char* unknown_cmd_msg = "Unknown command";
                         unsigned int k = 0;
                         if (cursor_pos < screen_total_bytes) {
@@ -442,29 +581,68 @@ void kmain(void) {
                     }
 
                     current_row = (cursor_pos / 2) / screen_width_chars;
-                    if ((cursor_pos / 2) % screen_width_chars != 0 || command_buffer_idx > 0 || command_found) {
+                    if ((cursor_pos / 2) % screen_width_chars != 0 || command_length > 0 || command_found) {
                         cursor_pos = (current_row + 1) * screen_width_chars * 2;
                     }
                     
-                    if (cursor_pos >= screen_total_bytes) {
-                    }
+                    command_length = 0;
+                    command_cursor_logical_idx = 0;
                     break; 
 
                 } else if (pressed_char == '\b') {
-                    if (cursor_pos > current_line_input_start_offset) {
-                        cursor_pos -= 2;
-                        vidptr[cursor_pos] = ' ';
-                        vidptr[cursor_pos+1] = 0x07;
-                        if (command_buffer_idx > 0) {
-                            command_buffer_idx--;
+                    if (command_cursor_logical_idx > 0 && command_length > 0) {
+                        for (unsigned int i = command_cursor_logical_idx - 1; i < command_length - 1; i++) {
+                            command_buffer[i] = command_buffer[i+1];
                         }
+                        command_length--;
+                        command_cursor_logical_idx--;
+                        command_buffer[command_length] = '\0';
+
+                        cursor_pos = current_line_input_start_offset + command_cursor_logical_idx * 2;
+
+                        unsigned int temp_screen_pos = cursor_pos;
+                        for (unsigned int i = command_cursor_logical_idx; i < command_length; i++) {
+                            vidptr[temp_screen_pos] = command_buffer[i];
+                            vidptr[temp_screen_pos+1] = 0x07;
+                            temp_screen_pos += 2;
+                        }
+                        vidptr[temp_screen_pos] = ' ';
+                        vidptr[temp_screen_pos+1] = 0x07;
+                    }
+                } else if (pressed_char == KEY_LEFT_ARROW) {
+                    if (command_cursor_logical_idx > 0) {
+                        command_cursor_logical_idx--;
+                        cursor_pos -= 2;
+                    }
+                } else if (pressed_char == KEY_RIGHT_ARROW) {
+                    if (command_cursor_logical_idx < command_length) {
+                        command_cursor_logical_idx++;
+                        cursor_pos += 2;
                     }
                 } else {
-                    if (command_buffer_idx < MAX_COMMAND_LENGTH - 1 && cursor_pos < screen_total_bytes -2) { 
-                        vidptr[cursor_pos] = pressed_char;
-                        vidptr[cursor_pos+1] = 0x07;
-                        command_buffer[command_buffer_idx++] = pressed_char;
-                        cursor_pos += 2;
+                    if (pressed_char >= ' ' && command_length < MAX_COMMAND_LENGTH - 1) {
+                        unsigned int current_char_screen_pos = current_line_input_start_offset + command_cursor_logical_idx * 2;
+                        if (current_char_screen_pos < (current_line_input_start_offset / (screen_width_chars*2) + 1) * screen_width_chars * 2 -2 &&
+                            current_char_screen_pos < screen_total_bytes -2) {
+
+                            for (unsigned int i = command_length; i > command_cursor_logical_idx; i--) {
+                                command_buffer[i] = command_buffer[i-1];
+                            }
+                            command_buffer[command_cursor_logical_idx] = pressed_char;
+                            command_length++;
+                            command_buffer[command_length] = '\0';
+
+                            unsigned int temp_screen_pos = current_char_screen_pos;
+                            for (unsigned int i = command_cursor_logical_idx; i < command_length; i++) {
+                                if (temp_screen_pos < screen_total_bytes - 2) {
+                                    vidptr[temp_screen_pos] = command_buffer[i];
+                                    vidptr[temp_screen_pos+1] = 0x07;
+                                    temp_screen_pos += 2;
+                                } else { break; }
+                            }
+                            command_cursor_logical_idx++;
+                            cursor_pos = current_line_input_start_offset + command_cursor_logical_idx * 2;
+                        }
                     }
                 }
                 update_cursor(cursor_pos);
