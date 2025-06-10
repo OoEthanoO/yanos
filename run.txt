@@ -3,4 +3,4 @@ nasm -f elf32 boot.s -o boot.o
 i686-elf-gcc -m32 -ffreestanding -T linker.ld -o yanos.bin -nostdlib boot.o kernel.o
 cp yanos.bin isodir/boot/yanos.bin
 i686-elf-grub-mkrescue -o yanos.iso isodir
-qemu-system-i386 -cdrom yanos.iso
+qemu-system-i386 -cdrom yanos.iso -hda yanos_hdd.img

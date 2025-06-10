@@ -20,6 +20,10 @@ static inline unsigned short inportw(unsigned short port) {
     return ret;
 }
 
+static inline void outportw(unsigned short port, unsigned short data) {
+    asm volatile ( "outw %0, %1" : : "a"(data), "Nd"(port) );
+}
+
 #define ATA_PRIMARY_DATA         0x1F0
 #define ATA_PRIMARY_ERROR        0x1F1
 #define ATA_PRIMARY_SECTOR_COUNT 0x1F2
@@ -43,6 +47,8 @@ static inline unsigned short inportw(unsigned short port) {
 #define ATA_SR_CORR 0x04
 #define ATA_SR_IDX  0x02
 #define ATA_SR_ERR  0x01
+
+#define FILE_TABLE_LBA 10001
 
 static void ata_wait_bsy_clear(void) {
     while (inportb(ATA_PRIMARY_STATUS) & ATA_SR_BSY) {
@@ -85,6 +91,40 @@ static int read_disk_sector(unsigned int lba, unsigned char* buffer) {
         buffer[i * 2] = (unsigned char)(data_word & 0xFF);
         buffer[i * 2 + 1] = (unsigned char)((data_word >> 8) & 0xFF);
     }
+    return 0;
+}
+
+static int write_disk_sector(unsigned int lba, const unsigned char* buffer) {
+    ata_wait_bsy_clear();
+    while (!(inportb(ATA_PRIMARY_STATUS) & ATA_SR_DRDY)) {
+        if (inportb(ATA_PRIMARY_STATUS) & ATA_SR_ERR) return 1;
+    }
+
+    outportb(ATA_PRIMARY_DRIVE_HEAD, 0xE0 | ((lba >> 24) & 0x0F));
+
+    outportb(ATA_PRIMARY_SECTOR_COUNT, 1);
+
+    outportb(ATA_PRIMARY_LBA_LOW, (unsigned char)(lba & 0xFF));
+
+    outportb(ATA_PRIMARY_LBA_MID, (unsigned char)((lba >> 8) & 0xFF));
+
+    outportb(ATA_PRIMARY_LBA_HIGH, (unsigned char)((lba >> 16) & 0xFF));
+
+    outportb(ATA_PRIMARY_COMMAND, ATA_CMD_WRITE_SECTORS);
+
+    ata_wait_drq_set();
+    if (inportb(ATA_PRIMARY_STATUS) & ATA_SR_ERR) {
+        return 1;
+    }
+
+    for (int i = 0; i < 256; i++) {
+        unsigned short data_word = (unsigned short)buffer[i * 2] | (unsigned short)(buffer[i * 2 + 1] << 8);
+        outportw(ATA_PRIMARY_DATA, data_word);
+    }
+
+    outportb(ATA_PRIMARY_COMMAND, ATA_CMD_CACHE_FLUSH);
+    ata_wait_bsy_clear();
+    
     return 0;
 }
 
@@ -162,6 +202,11 @@ static int strncmp_simple(const char* s1, const char* s2, unsigned int n) {
 struct File {
     char name[16];
     char content[128];
+    int in_use;
+};
+
+struct PersistentFileEntry {
+    char name[16];
     int in_use;
 };
 
@@ -285,8 +330,28 @@ static void fs_list_files(
 }
 
 static void fs_init(void) {
-    for (int i = 0; i < MAX_FILES; i++) {
-        file_table[i].in_use = 0;
+    unsigned char sector_buffer[512];
+
+    if (read_disk_sector(FILE_TABLE_LBA, sector_buffer) == 0) {
+        struct PersistentFileEntry* persistent_entries = (struct PersistentFileEntry*)sector_buffer;
+
+        for (int i = 0; i < MAX_FILES; i++) {
+            if ((unsigned char*)&persistent_entries[i] < sector_buffer + (MAX_FILES * sizeof(struct PersistentFileEntry))) {
+                if (persistent_entries[i].in_use == 1) {
+                    strncpy_simple(file_table[i].name, persistent_entries[i].name, sizeof(file_table[i].name));
+                    file_table[i].in_use = 1;
+                    file_table[i].content[0] = '\0';
+                } else {
+                    file_table[i].in_use = 0;
+                }
+            } else {
+                file_table[i].in_use = 0;
+            }
+        }
+    } else {
+        for (int i = 0; i < MAX_FILES; i++) {
+            file_table[i].in_use = 0;
+        }
     }
 }
 
@@ -332,6 +397,46 @@ void kmain(void) {
     update_cursor(cursor_pos);
     
     fs_init();
+
+    unsigned char test_buffer[512];
+    unsigned char read_buffer[512];
+    const unsigned int test_lba = 10000;
+    int success = 1;
+
+    for (int i = 0; i < 512; i++) {
+        test_buffer[i] = (unsigned char)(i % 256);
+    }
+
+    if (write_disk_sector(test_lba, test_buffer) != 0) {
+        success = 0;
+    }
+
+    if (success) {
+        for (int i = 0; i < 512; i++) {
+            read_buffer[i] = 0;
+        }
+
+        if (read_disk_sector(test_lba, read_buffer) != 0) {
+            success = 0;
+        }
+    }
+
+    if (success) {
+        for (int i = 0; i < 512; i++) {
+            if (read_buffer[i] != test_buffer[i]) {
+                success = 0;
+                break;
+            }
+        }
+    }
+
+    if (success) {
+        vidptr[0] = 'Y';
+        vidptr[1] = 0x0A;
+    } else {
+        vidptr[0] = 'Y';
+        vidptr[1] = 0x0C;
+    }
 
     while(1) {
         unsigned int prompt_start_row = (cursor_pos / 2) / screen_width_chars;
