@@ -49,6 +49,110 @@ static inline void outportw(unsigned short port, unsigned short data) {
 #define ATA_SR_ERR  0x01
 
 #define FILE_TABLE_LBA 10001
+#define SECTOR_BITMAP_LBA 10002
+#define DATA_START_LBA 10003
+#define NUM_DATA_SECTORS_MANAGED 4096
+#define SECTOR_BITMAP_SIZE_BYTES (NUM_DATA_SECTORS_MANAGED / 8)
+
+static unsigned char sector_bitmap[SECTOR_BITMAP_SIZE_BYTES];
+
+static int write_disk_sector(unsigned int lba, const unsigned char* buffer);
+static int read_disk_sector(unsigned int lba, unsigned char* buffer);
+static void ata_wait_bsy_clear(void);
+static void ata_wait_drq_set(void);
+
+static int is_sector_used(unsigned int sector_index) {
+    if (sector_index >= NUM_DATA_SECTORS_MANAGED) {
+        return 0;
+    }
+    unsigned int byte_index = sector_index / 8;
+    unsigned int bit_index = sector_index % 8;
+    return (sector_bitmap[byte_index] & (1 << bit_index)) != 0;
+}
+
+static void set_sector_used(unsigned int sector_index) {
+    if (sector_index >= NUM_DATA_SECTORS_MANAGED) {
+        return;
+    }
+    unsigned int byte_index = sector_index / 8;
+    unsigned int bit_index = sector_index % 8;
+    sector_bitmap[byte_index] |= (1 << bit_index);
+}
+
+static void set_sector_free(unsigned int sector_index) {
+    if (sector_index >= NUM_DATA_SECTORS_MANAGED) {
+        return;
+    }
+    unsigned int byte_index = sector_index / 8;
+    unsigned int bit_index = sector_index % 8;
+    sector_bitmap[byte_index] &= ~(1 << bit_index);
+}
+
+static unsigned int allocate_disk_space(unsigned int num_bytes) {
+    if (num_bytes == 0) {
+        return 0;
+    }
+
+    unsigned int num_sectors_needed = (num_bytes + 511) / 512;
+
+    if (num_sectors_needed == 0) {
+        return 0;
+    }
+    if (num_sectors_needed > NUM_DATA_SECTORS_MANAGED) {
+        return 0;
+    }
+
+    for (unsigned int i = 0; i < NUM_DATA_SECTORS_MANAGED - num_sectors_needed; ++i) {
+        int block_is_free = 1;
+        for (unsigned int j = 0; j < num_sectors_needed; ++j) {
+            if (is_sector_used(i + j)) {
+                block_is_free = 0;
+                break;
+            }
+        }
+
+        if (block_is_free) {
+            for (unsigned int j = 0; j < num_sectors_needed; ++j) {
+                set_sector_used(i + j);
+            }
+
+            if (write_disk_sector(SECTOR_BITMAP_LBA, sector_bitmap) != 0) {
+            }
+
+            return DATA_START_LBA + i;
+        }
+    }
+
+    return 0;
+}
+
+static void free_disk_space(unsigned int start_lba, unsigned int num_byte) {
+    if (num_byte == 0) {
+        return;
+    }
+
+    unsigned int num_sectors_to_free = (num_byte + 511) / 512;
+
+    if (num_sectors_to_free == 0) {
+        return;
+    }
+
+    if (start_lba < DATA_START_LBA) {
+        return;
+    }
+    unsigned int start_sector_index = start_lba - DATA_START_LBA;
+
+    if (start_sector_index + num_sectors_to_free > NUM_DATA_SECTORS_MANAGED) {
+        return;
+    }
+
+    for (unsigned int i = 0; i < num_sectors_to_free; ++i) {
+        set_sector_free(start_sector_index + i);
+    }
+
+    if (write_disk_sector(SECTOR_BITMAP_LBA, sector_bitmap) != 0) {
+    }
+}
 
 static void ata_wait_bsy_clear(void) {
     while (inportb(ATA_PRIMARY_STATUS) & ATA_SR_BSY) {
@@ -203,11 +307,15 @@ struct File {
     char name[16];
     char content[128];
     int in_use;
+    unsigned int content_start_lba;
+    unsigned int content_size_bytes;
 };
 
 struct PersistentFileEntry {
     char name[16];
     int in_use;
+    unsigned int content_start_lba;
+    unsigned int content_size_bytes;
 };
 
 #define MAX_FILES 10
@@ -237,6 +345,32 @@ static int fs_create_file(const char* filename) {
             strncpy_simple(file_table[i].name, filename, sizeof(file_table[i].name));
             file_table[i].in_use = 1;
             file_table[i].content[0] = '\0';
+            file_table[i].content_start_lba = 0;
+            file_table[i].content_size_bytes = 0;
+
+            unsigned char sector_buffer[512];
+            if (read_disk_sector(FILE_TABLE_LBA, sector_buffer) != 0) {
+                for (int k_buf = 0; k_buf < 512; k_buf++) sector_buffer[k_buf] = 0;
+            }
+
+            struct PersistentFileEntry* persistent_entries = (struct PersistentFileEntry*)sector_buffer;
+            int max_persistent_entries_in_sector = 512 / sizeof(struct PersistentFileEntry);
+
+            if (i < max_persistent_entries_in_sector) {
+                 strncpy_simple(persistent_entries[i].name, file_table[i].name, sizeof(persistent_entries[i].name));
+                 persistent_entries[i].in_use = 1;
+                 persistent_entries[i].content_start_lba = 0;
+                 persistent_entries[i].content_size_bytes = 0;
+            } else {
+                file_table[i].in_use = 0; 
+                return 1;
+            }
+            
+            if (write_disk_sector(FILE_TABLE_LBA, sector_buffer) != 0) {
+                file_table[i].in_use = 0;
+                return 1;
+            }
+
             return 0;
         }
     }
@@ -246,25 +380,144 @@ static int fs_create_file(const char* filename) {
 static int fs_write_file(const char* filename, const char* data) {
     for (int i = 0; i < MAX_FILES; i++) {
         if (file_table[i].in_use == 1 && strcmp_simple(file_table[i].name, filename) == 0) {
-            if (strlen_simple(data) < sizeof(file_table[i].content)) {
-                strncpy_simple(file_table[i].content, data, sizeof(file_table[i].content));
-                return 0;
-            } else {
-                return 1;
+            unsigned int data_len = strlen_simple(data);
+
+            // 1. Free existing disk space if file already has content on disk
+            if (file_table[i].content_start_lba != 0 && file_table[i].content_size_bytes > 0) {
+                free_disk_space(file_table[i].content_start_lba, file_table[i].content_size_bytes);
+                // Reset in-memory metadata for content, will be updated if new content is written
+                file_table[i].content_start_lba = 0;
+                file_table[i].content_size_bytes = 0;
             }
+
+            // If data_len is 0, we are effectively clearing the file content
+            if (data_len == 0) {
+                file_table[i].content[0] = '\0'; // Clear in-memory cache
+                file_table[i].content_start_lba = 0;
+                file_table[i].content_size_bytes = 0;
+
+                // Update on-disk persistent file table for empty content
+                unsigned char sector_buffer_ft[512];
+                if (read_disk_sector(FILE_TABLE_LBA, sector_buffer_ft) != 0) { return 1; /* Error reading file table */ }
+                struct PersistentFileEntry* persistent_entries = (struct PersistentFileEntry*)sector_buffer_ft;
+                int max_persistent_entries_in_sector = 512 / sizeof(struct PersistentFileEntry);
+                if (i < max_persistent_entries_in_sector) {
+                    persistent_entries[i].content_start_lba = 0;
+                    persistent_entries[i].content_size_bytes = 0;
+                } else { return 1; /* Index out of bounds */ }
+                if (write_disk_sector(FILE_TABLE_LBA, sector_buffer_ft) != 0) { return 1; /* Error writing file table */ }
+                return 0; // Successfully "wrote" empty content
+            }
+
+            // 2. Allocate new disk space for the new content
+            unsigned int new_lba = allocate_disk_space(data_len);
+            if (new_lba == 0) {
+                return 1; // Failed to allocate disk space
+            }
+
+            // 3. Write the new content to the allocated disk sectors
+            unsigned int bytes_written = 0;
+            unsigned int current_lba_data = new_lba;
+            unsigned char sector_buffer_data[512];
+
+            while (bytes_written < data_len) {
+                unsigned int bytes_to_write_this_sector = data_len - bytes_written;
+                if (bytes_to_write_this_sector > 512) {
+                    bytes_to_write_this_sector = 512;
+                }
+
+                for (unsigned int k = 0; k < 512; k++) sector_buffer_data[k] = 0; // Zero out buffer
+                for (unsigned int k = 0; k < bytes_to_write_this_sector; k++) {
+                    sector_buffer_data[k] = data[bytes_written + k];
+                }
+
+                if (write_disk_sector(current_lba_data, sector_buffer_data) != 0) {
+                    free_disk_space(new_lba, data_len); // Attempt to rollback by freeing allocated space
+                    return 1; // Error writing data sector
+                }
+                bytes_written += bytes_to_write_this_sector;
+                current_lba_data++;
+            }
+
+            // 4. Update in-memory file table entry
+            file_table[i].content_start_lba = new_lba;
+            file_table[i].content_size_bytes = data_len;
+            if (data_len < sizeof(file_table[i].content)) {
+                strncpy_simple(file_table[i].content, data, sizeof(file_table[i].content));
+            } else {
+                file_table[i].content[0] = '\0'; // Content too large for cache, indicate it's on disk
+            }
+
+            // 5. Update the on-disk persistent file table entry
+            unsigned char sector_buffer_ft[512];
+            if (read_disk_sector(FILE_TABLE_LBA, sector_buffer_ft) != 0) {
+                // Data written to disk, but cannot update file table. This is a critical error.
+                // A more robust system might try to mark the file system as inconsistent.
+                return 1; /* Error reading file table */
+            }
+            struct PersistentFileEntry* persistent_entries = (struct PersistentFileEntry*)sector_buffer_ft;
+            int max_persistent_entries_in_sector = 512 / sizeof(struct PersistentFileEntry);
+
+            if (i < max_persistent_entries_in_sector) {
+                persistent_entries[i].content_start_lba = new_lba;
+                persistent_entries[i].content_size_bytes = data_len;
+            } else { return 1; /* Index out of bounds */ }
+            
+            if (write_disk_sector(FILE_TABLE_LBA, sector_buffer_ft) != 0) {
+                // Similar critical error as above.
+                return 1; /* Error writing file table */
+            }
+
+            return 0; // Success
         }
     }
-    return 1;
+    return 1; // File not found
 }
 
 static int fs_delete_file(const char* filename) {
     for (int i = 0; i < MAX_FILES; i++) {
         if (file_table[i].in_use == 1 && strcmp_simple(file_table[i].name, filename) == 0) {
+            // 1. Free disk space used by the file content, if any
+            if (file_table[i].content_start_lba != 0 && file_table[i].content_size_bytes > 0) {
+                free_disk_space(file_table[i].content_start_lba, file_table[i].content_size_bytes);
+            }
+
+            // 2. Update in-memory file table entry
             file_table[i].in_use = 0;
-            return 0;
+            file_table[i].name[0] = '\0'; 
+            file_table[i].content[0] = '\0'; 
+            file_table[i].content_start_lba = 0;
+            file_table[i].content_size_bytes = 0;
+
+            // 3. Update the on-disk persistent file table entry
+            unsigned char sector_buffer[512];
+            if (read_disk_sector(FILE_TABLE_LBA, sector_buffer) != 0) {
+                // Error reading file table. State might be inconsistent.
+                // A robust system would handle this, e.g., by trying to repair or logging.
+                return 1; // Error reading file table
+            }
+
+            struct PersistentFileEntry* persistent_entries = (struct PersistentFileEntry*)sector_buffer;
+            int max_persistent_entries_in_sector = 512 / sizeof(struct PersistentFileEntry);
+
+            if (i < max_persistent_entries_in_sector) {
+                persistent_entries[i].in_use = 0;
+                persistent_entries[i].name[0] = '\0'; 
+                persistent_entries[i].content_start_lba = 0;
+                persistent_entries[i].content_size_bytes = 0;
+            } else { 
+                return 1; // Index out of bounds for single sector persistent table
+            }
+            
+            if (write_disk_sector(FILE_TABLE_LBA, sector_buffer) != 0) {
+                // Error writing file table back. State is inconsistent.
+                return 1; // Error writing file table
+            }
+
+            return 0; // Success
         }
     }
-    return 1;
+    return 1; // File not found
 }
 
 static int fs_read_file(
@@ -272,33 +525,75 @@ static int fs_read_file(
     char* vidptr,
     unsigned int* cursor_pos_ptr,
     unsigned int screen_width_chars,
+    unsigned int screen_height_chars, // Added parameter
     unsigned int screen_total_bytes
 ) {
     for (int i = 0; i < MAX_FILES; i++) {
         if (file_table[i].in_use == 1 && strcmp_simple(file_table[i].name, filename) == 0) {
-            unsigned int content_idx = 0;
-            while (file_table[i].content[content_idx] != '\0') {
-                if (*cursor_pos_ptr >= screen_total_bytes - 2 && file_table[i].content[content_idx] != '\n') {
-                    break;
+            // If file has no persistent content or is empty
+            if (file_table[i].content_start_lba == 0 || file_table[i].content_size_bytes == 0) {
+                // Optionally, print "(empty)" or just advance cursor to next line
+                unsigned int current_row_for_newline = (*cursor_pos_ptr / 2) / screen_width_chars;
+                *cursor_pos_ptr = (current_row_for_newline + 1) * screen_width_chars * 2;
+                if (*cursor_pos_ptr >= screen_total_bytes) {
+                     // Clamp to the start of the last line if screen is full
+                     *cursor_pos_ptr = (screen_height_chars - 1) * screen_width_chars * 2;
+                }
+                return 0; // Successfully "read" an empty file
+            }
+
+            unsigned char sector_buffer[512];
+            unsigned int bytes_processed_from_disk = 0;
+            unsigned int current_lba_data = file_table[i].content_start_lba;
+            unsigned int total_bytes_to_display = file_table[i].content_size_bytes;
+
+            while (bytes_processed_from_disk < total_bytes_to_display) {
+                if (read_disk_sector(current_lba_data, sector_buffer) != 0) {
+                    const char* read_err_msg = "[Read Error]";
+                    unsigned int k_err = 0;
+                    while(read_err_msg[k_err] != '\0' && *cursor_pos_ptr < screen_total_bytes - 2) {
+                        vidptr[*cursor_pos_ptr] = read_err_msg[k_err];
+                        vidptr[*cursor_pos_ptr + 1] = 0x0C; // Red on black for error
+                        *cursor_pos_ptr += 2;
+                        k_err++;
+                    }
+                    return 1; // Error reading data sector
                 }
 
-                if (file_table[i].content[content_idx] == '\n') {
-                    unsigned int current_row_for_newline = (*cursor_pos_ptr / 2) / screen_width_chars;
-                    *cursor_pos_ptr = (current_row_for_newline + 1) * screen_width_chars * 2;
-                    if (*cursor_pos_ptr >= screen_total_bytes) {
-                        break;
-                    }
-                } else {
-                    vidptr[*cursor_pos_ptr] = file_table[i].content[content_idx];
-                    vidptr[*cursor_pos_ptr + 1] = 0x07;
-                    *cursor_pos_ptr += 2;
+                unsigned int bytes_to_process_this_sector = total_bytes_to_display - bytes_processed_from_disk;
+                if (bytes_to_process_this_sector > 512) {
+                    bytes_to_process_this_sector = 512;
                 }
-                content_idx++;
+
+                for (unsigned int char_idx_in_sector = 0; char_idx_in_sector < bytes_to_process_this_sector; char_idx_in_sector++) {
+                    char current_char = sector_buffer[char_idx_in_sector];
+                    
+                    if (*cursor_pos_ptr >= screen_total_bytes -2 && current_char != '\n') { // Check screen bounds before printing char
+                         return 0; // Screen full, stop.
+                    }
+
+                    if (current_char == '\n') {
+                        unsigned int current_row_for_newline = (*cursor_pos_ptr / 2) / screen_width_chars;
+                        *cursor_pos_ptr = (current_row_for_newline + 1) * screen_width_chars * 2;
+                        if (*cursor_pos_ptr >= screen_total_bytes) {
+                            // Screen is full after processing newline.
+                            // A real terminal would scroll here. We clamp to last line.
+                            *cursor_pos_ptr = (screen_height_chars - 1) * screen_width_chars * 2;
+                            return 0; // Reached end of screen
+                        }
+                    } else {
+                        vidptr[*cursor_pos_ptr] = current_char;
+                        vidptr[*cursor_pos_ptr + 1] = 0x07; // Standard attribute
+                        *cursor_pos_ptr += 2;
+                    }
+                }
+                bytes_processed_from_disk += bytes_to_process_this_sector;
+                current_lba_data++;
             }
-            return 0;
+            return 0; // Successfully read and displayed file
         }
     }
-    return 1;
+    return 1; // File not found
 }
 
 static void fs_list_files(
@@ -330,28 +625,40 @@ static void fs_list_files(
 }
 
 static void fs_init(void) {
-    unsigned char sector_buffer[512];
+    unsigned char file_table_sector_buffer[512];
 
-    if (read_disk_sector(FILE_TABLE_LBA, sector_buffer) == 0) {
-        struct PersistentFileEntry* persistent_entries = (struct PersistentFileEntry*)sector_buffer;
+    for (int i = 0; i < MAX_FILES; i++) {
+        file_table[i].in_use = 0;
+        file_table[i].content_start_lba = 0;
+        file_table[i].content_size_bytes = 0;
+        file_table[i].content[0] = '\0';
+    }
 
-        for (int i = 0; i < MAX_FILES; i++) {
-            if ((unsigned char*)&persistent_entries[i] < sector_buffer + (MAX_FILES * sizeof(struct PersistentFileEntry))) {
-                if (persistent_entries[i].in_use == 1) {
-                    strncpy_simple(file_table[i].name, persistent_entries[i].name, sizeof(file_table[i].name));
-                    file_table[i].in_use = 1;
-                    file_table[i].content[0] = '\0';
-                } else {
-                    file_table[i].in_use = 0;
-                }
+    if (read_disk_sector(FILE_TABLE_LBA, file_table_sector_buffer) == 0) {
+        struct PersistentFileEntry* persistent_entries = (struct PersistentFileEntry*)file_table_sector_buffer;
+        int max_persistent_entries_in_sector = 512 / sizeof(struct PersistentFileEntry);
+
+        for (int i = 0; i < MAX_FILES && i < max_persistent_entries_in_sector; i++) {
+            if (persistent_entries[i].in_use == 1) {
+                strncpy_simple(file_table[i].name, persistent_entries[i].name, sizeof(file_table[i].name));
+                file_table[i].in_use = 1;
+                file_table[i].content_start_lba = persistent_entries[i].content_start_lba;
+                file_table[i].content_size_bytes = persistent_entries[i].content_size_bytes;
+                file_table[i].content[0] = '\0';
             } else {
                 file_table[i].in_use = 0;
+                file_table[i].content_start_lba = 0;
+                file_table[i].content_size_bytes = 0;
             }
         }
     } else {
-        for (int i = 0; i < MAX_FILES; i++) {
-            file_table[i].in_use = 0;
+    }
+
+    if (read_disk_sector(SECTOR_BITMAP_LBA, sector_bitmap) != 0) {
+        for (int i = 0; i < SECTOR_BITMAP_SIZE_BYTES; i++) {
+            sector_bitmap[i] = 0;
         }
+        write_disk_sector(SECTOR_BITMAP_LBA, sector_bitmap);
     }
 }
 
@@ -583,7 +890,7 @@ void kmain(void) {
                         const char* msg = NULL;
 
                         if (strlen_simple(filename_to_read) > 0) {
-                            if (fs_read_file(filename_to_read, vidptr, &cursor_pos, screen_width_chars, screen_total_bytes) != 0) {
+                            if (fs_read_file(filename_to_read, vidptr, &cursor_pos, screen_width_chars, screen_height_chars, screen_total_bytes) != 0) {
                                 msg = "Error: File not found.";
                             }
                         } else {
@@ -629,7 +936,7 @@ void kmain(void) {
                         const char* msg = NULL;
 
                         if (strlen_simple(filename_to_read) > 0) {
-                            if (fs_read_file(filename_to_read, vidptr, &cursor_pos, screen_width_chars, screen_total_bytes) != 0) {
+                            if (fs_read_file(filename_to_read, vidptr, &cursor_pos, screen_width_chars, screen_height_chars, screen_total_bytes) != 0) {
                                 msg = "Error: File not found.";
                             }
                         } else {
