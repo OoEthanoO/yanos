@@ -315,6 +315,7 @@ struct File {
     unsigned int content_start_lba;
     unsigned int content_size_bytes;
     enum EntryType type;
+    int parent_dir_idx;
 };
 
 struct PersistentFileEntry {
@@ -323,6 +324,7 @@ struct PersistentFileEntry {
     unsigned int content_start_lba;
     unsigned int content_size_bytes;
     enum EntryType type;
+    int parent_dir_idx;
 };
 
 #define MAX_FILES 10
@@ -343,7 +345,7 @@ static int fs_create_directory(const char* dirname) {
     }
 
     for (int i = 0; i < MAX_FILES; i++) {
-        if (file_table[i].in_use == 1 && strcmp_simple(file_table[i].name, dirname) == 0) {
+        if (file_table[i].in_use == 1 && strcmp_simple(file_table[i].name, dirname) == 0 && file_table[i].parent_dir_idx == current_working_directory_idx) {
             return 1;
         }
     }
@@ -356,6 +358,7 @@ static int fs_create_directory(const char* dirname) {
             file_table[i].content_start_lba = 0;
             file_table[i].content_size_bytes = 0;
             file_table[i].content[0] = '\0';
+            file_table[i].parent_dir_idx = current_working_directory_idx;
 
             unsigned char sector_buffer[512];
             if (read_disk_sector(FILE_TABLE_LBA, sector_buffer) != 0) {
@@ -371,6 +374,7 @@ static int fs_create_directory(const char* dirname) {
                 persistent_entries[i].type = TYPE_DIRECTORY;
                 persistent_entries[i].content_start_lba = 0;
                 persistent_entries[i].content_size_bytes = 0;
+                persistent_entries[i].parent_dir_idx = file_table[i].parent_dir_idx;
             } else {
                 file_table[i].in_use = 0;
                 return 1;
@@ -387,6 +391,86 @@ static int fs_create_directory(const char* dirname) {
     return 1;
 }
 
+static void reverse_string(char* str, int length) {
+    int start = 0;
+    int end = length - 1;
+    while (start < end) {
+        char temp = str[start];
+        str[start] = str[end];
+        str[end] = temp;
+        start++;
+        end--;
+    }
+}
+
+#define MAX_PATH_LENGTH 256
+
+static void get_current_path_string(char* buffer, int buffer_size) {
+    if (buffer_size <= 0) return;
+    buffer[0] = '\0';
+
+    if (current_working_directory_idx == 0) {
+        if (buffer_size > 1) {
+            buffer[0] = '/';
+            buffer[1] = '\0';
+        }
+        return;
+    }
+
+    char temp_path[MAX_PATH_LENGTH];
+    int temp_path_len = 0;
+    int current_dir_idx_walker = current_working_directory_idx;
+
+    while (current_dir_idx_walker != 0 && temp_path_len < MAX_PATH_LENGTH - 1) {
+        int name_len = strlen_simple(file_table[current_dir_idx_walker].name);
+        if (temp_path_len + name_len + 1 >= MAX_PATH_LENGTH) {
+            break;
+        }
+        for (int i = name_len - 1; i >= 0; i--) {
+            if (temp_path_len < MAX_PATH_LENGTH - 1) {
+                temp_path[temp_path_len++] = file_table[current_dir_idx_walker].name[i];
+            } else break;
+        }
+        if (temp_path_len < MAX_PATH_LENGTH - 1) {
+            temp_path[temp_path_len++] = '/';
+        } else break;
+
+        current_dir_idx_walker = file_table[current_dir_idx_walker].parent_dir_idx;
+    }
+    temp_path[temp_path_len] = '\0';
+
+    reverse_string(temp_path, temp_path_len);
+
+    if (buffer_size > temp_path_len + 1) {
+        buffer[0] = '/';
+        strncpy_simple(buffer + 1, temp_path, buffer_size - 1);
+        buffer[temp_path_len + 1] = '\0';
+    } else if (buffer_size > 0) {
+        buffer[0] = '\0';
+    }
+
+    if (buffer[0] == '/' && buffer[1] == '/' && buffer[2] == '\0') {
+        buffer[1] = '\0';
+    }
+    if (buffer[0] == '/' && buffer[1] == '/' && temp_path_len > 0) {
+        int k = 0;
+        while (buffer[k+1] != '\0' && k < buffer_size - 1) {
+            buffer[k] = buffer[k + 1];
+            k++;
+        }
+        buffer[k] = '\0';
+    }
+
+    if (strlen_simple(buffer) == 0 && current_working_directory_idx == 0) {
+        if (buffer_size > 1) {
+            buffer[0] = '/';
+            buffer[1] = '\0';
+        }
+    } else if (strlen_simple(buffer) > 1 && buffer[0] == '/' && buffer[strlen_simple(buffer) - 1] == '/' && current_working_directory_idx != 0) {
+        buffer[strlen_simple(buffer) - 1] = '\0';
+    }
+}
+
 static int fs_change_directory(const char* path) {
     if (strcmp_simple(path, "/") == 0) {
         current_working_directory_idx = 0;
@@ -399,13 +483,13 @@ static int fs_change_directory(const char* path) {
 
     if (strcmp_simple(path, "..") == 0) {
         if (current_working_directory_idx != 0) {
-            current_working_directory_idx = 0;
+            current_working_directory_idx = file_table[current_working_directory_idx].parent_dir_idx;
         }
         return 0;
     }
 
     for (int i = 0; i < MAX_FILES; i++) {
-        if (file_table[i].in_use == 1 && file_table[i].type == TYPE_DIRECTORY && strcmp_simple(file_table[i].name, path) == 0) {
+        if (file_table[i].in_use == 1 && file_table[i].type == TYPE_DIRECTORY && file_table[i].parent_dir_idx == current_working_directory_idx && strcmp_simple(file_table[i].name, path) == 0) {
             current_working_directory_idx = i;
             return 0;
         }
@@ -420,7 +504,7 @@ static int fs_create_file(const char* filename) {
     }
 
     for (int i = 0; i < MAX_FILES; i++) {
-        if (file_table[i].in_use == 1 && strcmp_simple(file_table[i].name, filename) == 0) {
+        if (file_table[i].in_use == 1 && strcmp_simple(file_table[i].name, filename) == 0 && file_table[i].parent_dir_idx == current_working_directory_idx) {
             return 1;
         }
     }
@@ -433,6 +517,7 @@ static int fs_create_file(const char* filename) {
             file_table[i].content_start_lba = 0;
             file_table[i].content_size_bytes = 0;
             file_table[i].type = TYPE_FILE;
+            file_table[i].parent_dir_idx = current_working_directory_idx;
 
             unsigned char sector_buffer[512];
             if (read_disk_sector(FILE_TABLE_LBA, sector_buffer) != 0) {
@@ -448,6 +533,7 @@ static int fs_create_file(const char* filename) {
                  persistent_entries[i].content_start_lba = 0;
                  persistent_entries[i].content_size_bytes = 0;
                  persistent_entries[i].type = TYPE_FILE;
+                 persistent_entries[i].parent_dir_idx = file_table[i].parent_dir_idx;
             } else {
                 file_table[i].in_use = 0;
                 return 1;
@@ -466,7 +552,7 @@ static int fs_create_file(const char* filename) {
 
 static int fs_write_file(const char* filename, const char* data) {
     for (int i = 0; i < MAX_FILES; i++) {
-        if (file_table[i].in_use == 1 && strcmp_simple(file_table[i].name, filename) == 0) {
+        if (file_table[i].in_use == 1 && strcmp_simple(file_table[i].name, filename) == 0 && file_table[i].parent_dir_idx == current_working_directory_idx && file_table[i].type == TYPE_FILE) {
             unsigned int data_len = strlen_simple(data);
 
             if (file_table[i].content_start_lba != 0 && file_table[i].content_size_bytes > 0) {
@@ -552,7 +638,7 @@ static int fs_write_file(const char* filename, const char* data) {
 
 static int fs_delete_file(const char* filename) {
     for (int i = 0; i < MAX_FILES; i++) {
-        if (file_table[i].in_use == 1 && strcmp_simple(file_table[i].name, filename) == 0) {
+        if (file_table[i].in_use == 1 && strcmp_simple(file_table[i].name, filename) == 0 && file_table[i].parent_dir_idx == current_working_directory_idx && file_table[i].type == TYPE_FILE) {
             if (file_table[i].content_start_lba != 0 && file_table[i].content_size_bytes > 0) {
                 free_disk_space(file_table[i].content_start_lba, file_table[i].content_size_bytes);
             }
@@ -590,6 +676,58 @@ static int fs_delete_file(const char* filename) {
     return 1;
 }
 
+static int fs_delete_directory(const char* dirname) {
+    int dir_to_delete_idx = -1;
+
+    for (int i = 0; i < MAX_FILES; i++) {
+        if (file_table[i].in_use == 1 && strcmp_simple(file_table[i].name, dirname) == 0 && file_table[i].type == TYPE_DIRECTORY && file_table[i].parent_dir_idx == current_working_directory_idx) {
+            dir_to_delete_idx = i;
+            break;
+        }
+    }
+
+    if (dir_to_delete_idx == -1) {
+        return 1;
+    }
+
+    if (dir_to_delete_idx == 0) {
+        return 1;
+    }
+
+    for (int i = 0; i < MAX_FILES; i++) {
+        if (file_table[i].in_use == 1 && file_table[i].parent_dir_idx == dir_to_delete_idx) {
+            return 1;
+        }
+    }
+
+    file_table[dir_to_delete_idx].in_use = 0;
+    file_table[dir_to_delete_idx].name[0] = '\0';
+
+    unsigned char sector_buffer[512];
+    if (read_disk_sector(FILE_TABLE_LBA, sector_buffer) != 0) {
+        file_table[dir_to_delete_idx].in_use = 1;
+        return 1;
+    }
+
+    struct PersistentFileEntry* persistent_entries = (struct PersistentFileEntry*)sector_buffer;
+    int max_persistent_entries_in_sector = 512 / sizeof(struct PersistentFileEntry);
+
+    if (dir_to_delete_idx < max_persistent_entries_in_sector) {
+        persistent_entries[dir_to_delete_idx].in_use = 0;
+        persistent_entries[dir_to_delete_idx].name[0] = '\0';
+    } else {
+        file_table[dir_to_delete_idx].in_use = 1;
+        return 1;
+    }
+
+    if (write_disk_sector(FILE_TABLE_LBA, sector_buffer) != 0) {
+        file_table[dir_to_delete_idx].in_use = 1;
+        return 1;
+    }
+
+    return 0;
+}
+
 static int fs_read_file(
     const char* filename,
     char* vidptr,
@@ -599,7 +737,7 @@ static int fs_read_file(
     unsigned int screen_total_bytes
 ) {
     for (int i = 0; i < MAX_FILES; i++) {
-        if (file_table[i].in_use == 1 && strcmp_simple(file_table[i].name, filename) == 0) {
+        if (file_table[i].in_use == 1 && strcmp_simple(file_table[i].name, filename) == 0 && file_table[i].parent_dir_idx == current_working_directory_idx && file_table[i].type == TYPE_FILE) {
             if (file_table[i].content_start_lba == 0 || file_table[i].content_size_bytes == 0) {
                 unsigned int current_row_for_newline = (*cursor_pos_ptr / 2) / screen_width_chars;
                 *cursor_pos_ptr = (current_row_for_newline + 1) * screen_width_chars * 2;
@@ -669,7 +807,7 @@ static void fs_list_files(
     unsigned int screen_total_bytes
 ) {
     for (int i = 0; i < MAX_FILES; i++) {
-        if (file_table[i].in_use == 1) {
+        if (file_table[i].in_use == 1 && file_table[i].parent_dir_idx == current_working_directory_idx) {
             if ((*cursor_pos_ptr / 2) % screen_width_chars != 0) {
                 unsigned int current_row_for_newline = (*cursor_pos_ptr / 2) / screen_width_chars;
                 *cursor_pos_ptr = (current_row_for_newline + 1) * screen_width_chars * 2;
@@ -720,6 +858,7 @@ static void fs_init(void) {
         file_table[i].content_size_bytes = 0;
         file_table[i].content[0] = '\0';
         file_table[i].type = TYPE_FILE;
+        file_table[i].parent_dir_idx = 0;
     }
 
     if (read_disk_sector(FILE_TABLE_LBA, file_table_sector_buffer) == 0) {
@@ -734,6 +873,7 @@ static void fs_init(void) {
                 file_table[i].content_start_lba = persistent_entries[i].content_start_lba;
                 file_table[i].content_size_bytes = persistent_entries[i].content_size_bytes;
                 file_table[i].type = persistent_entries[i].type;
+                file_table[i].parent_dir_idx = persistent_entries[i].parent_dir_idx;
                 file_table[i].content[0] = '\0';
             } else {
                 file_table[i].in_use = 0;
@@ -741,6 +881,7 @@ static void fs_init(void) {
                 file_table[i].content_start_lba = 0;
                 file_table[i].content_size_bytes = 0;
                 file_table[i].type = TYPE_FILE;
+                file_table[i].parent_dir_idx = 0;
             }
         }
     } else {
@@ -748,13 +889,14 @@ static void fs_init(void) {
     }
 
     int root_dir_needs_initialization = 0;
-    if (!file_table_loaded_successfully || file_table[0].in_use == 0 || file_table[0].type != TYPE_DIRECTORY || strcmp_simple(file_table[0].name, "/") != 0) {
+    if (!file_table_loaded_successfully || file_table[0].in_use == 0 || file_table[0].type != TYPE_DIRECTORY || strcmp_simple(file_table[0].name, "/") != 0 || file_table[0].parent_dir_idx != 0) {
         root_dir_needs_initialization = 1;
         strncpy_simple(file_table[0].name, "/", sizeof(file_table[0].name));
         file_table[0].in_use = 1;
         file_table[0].type = TYPE_DIRECTORY;
         file_table[0].content_start_lba = 0;
         file_table[0].content_size_bytes = 0;
+        file_table[0].parent_dir_idx = 0;
         file_table[0].content[0] = '\0';
     }
 
@@ -768,6 +910,7 @@ static void fs_init(void) {
             persistent_entries[0].type = file_table[0].type;
             persistent_entries[0].content_start_lba = file_table[0].content_start_lba;
             persistent_entries[0].content_size_bytes = file_table[0].content_size_bytes;
+            persistent_entries[0].parent_dir_idx = file_table[0].parent_dir_idx;
 
             if (write_disk_sector(FILE_TABLE_LBA, file_table_sector_buffer) != 0) {
             }
@@ -783,7 +926,9 @@ static void fs_init(void) {
 }
 
 void kmain(void) {
-    const char *prompt_display_str = "> ";
+    char current_path_prompt[MAX_PATH_LENGTH + 3];
+    char path_buffer[MAX_PATH_LENGTH];
+
     char *vidptr = (char*)0xb8000;
     unsigned int loop_idx;
 
@@ -793,8 +938,8 @@ void kmain(void) {
     const unsigned int screen_width_chars = 80;
     const unsigned int screen_height_chars = 25;
     const unsigned int screen_total_bytes = screen_width_chars * screen_height_chars * 2;
-    const unsigned int prompt_len_chars = strlen_simple(prompt_display_str);
-    const unsigned int prompt_len_bytes = prompt_len_chars * 2;
+    // const unsigned int prompt_len_chars = strlen_simple(prompt_display_str);
+    // const unsigned int prompt_len_bytes = prompt_len_chars * 2;
 
     char command_buffer[MAX_COMMAND_LENGTH];
     unsigned int command_length = 0;
@@ -866,6 +1011,40 @@ void kmain(void) {
     }
 
     while(1) {
+        get_current_path_string(path_buffer, MAX_PATH_LENGTH);
+        unsigned int path_len = strlen_simple(path_buffer);
+
+        if (path_len + 3 <= sizeof(current_path_prompt)) {
+            strncpy_simple(current_path_prompt, path_buffer, sizeof(current_path_prompt));
+            current_path_prompt[path_len] = ' ';
+            if (path_len > 1 || (path_len == 1 && path_buffer[0] != '/')) {
+                current_path_prompt[path_len] = ' ';
+            }
+            if (path_len == 1 && path_buffer[0] == '/') {
+                current_path_prompt[path_len] = ' ';
+                current_path_prompt[path_len + 1] = '>';
+                current_path_prompt[path_len + 2] = ' ';
+                current_path_prompt[path_len + 3] = '\0';
+            } else if (path_len > 0) {
+                current_path_prompt[path_len + 1] = '>';
+                current_path_prompt[path_len + 2] = ' ';
+                current_path_prompt[path_len + 3] = '\0';
+            } else {
+                current_path_prompt[path_len] = '>';
+                current_path_prompt[path_len + 1] = ' ';
+                current_path_prompt[path_len + 2] = '\0';
+            }
+        } else {
+            strncpy_simple(current_path_prompt, "> ", sizeof(current_path_prompt));
+        }
+        if(strlen_simple(current_path_prompt) == 0) {
+            strncpy_simple(current_path_prompt, "> ", sizeof(current_path_prompt));
+        }
+
+        const char *prompt_display_str = current_path_prompt;
+        const unsigned int prompt_len_chars = strlen_simple(prompt_display_str);
+        const unsigned int prompt_len_bytes = prompt_len_chars * 2;
+
         unsigned int prompt_start_row = (cursor_pos / 2) / screen_width_chars;
         unsigned int prompt_start_col_bytes = cursor_pos % (screen_width_chars * 2);
 
@@ -1090,6 +1269,28 @@ void kmain(void) {
                             }
                         } else {
                             msg = "Usage: rm <filename>";
+                        }
+                        unsigned int k = 0;
+                        if (cursor_pos < screen_total_bytes) {
+                            while(msg[k] != '\0' && cursor_pos < screen_total_bytes - 2) {
+                                vidptr[cursor_pos] = msg[k];
+                                vidptr[cursor_pos+1] = 0x07;
+                                cursor_pos += 2;
+                                k++;
+                            }
+                        }
+                    } else if (strncmp_simple(command_buffer, "rmdir ", 6) == 0) {
+                        command_found = 1;
+                        const char* dirname_to_delete = command_buffer + 6;
+                        const char* msg;
+                        if (strlen_simple(dirname_to_delete) > 0) {
+                            if (fs_delete_directory(dirname_to_delete) == 0) {
+                                msg = "Directory deleted.";
+                            } else {
+                                msg = "Error deleting directory (not found or not empty).";
+                            }
+                        } else {
+                            msg = "Usage: rmdir <dirname>";
                         }
                         unsigned int k = 0;
                         if (cursor_pos < screen_total_bytes) {
